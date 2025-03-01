@@ -1,0 +1,258 @@
+using System;
+using System.Linq;
+using System.Collections.Generic;
+using Exiled.API.Features;
+using Exiled.API.Enums;
+using Exiled.Events.EventArgs.Player;
+using PlayerRoles;
+using System.ComponentModel;
+
+namespace FactionHUD
+{
+    public class MainPlugin : Plugin<Config>
+    {
+        private static readonly HashSet<Player> ScpPlayers = new();
+        private static readonly object UpdateLock = new();
+
+        public override void OnEnabled()
+        {
+            ValidateConfig();
+            SubscribeEvents();
+            Log.Info($"插件已加载 [v{Assembly.GetExecutingAssembly().GetName().Version}]");
+        }
+
+        public override void OnDisabled()
+        {
+            UnsubscribeEvents();
+            ScpPlayers.Clear();
+        }
+
+        #region 事件管理
+        private void SubscribeEvents()
+        {
+            Exiled.Events.Handles.Player.Spawned += OnPlayerSpawned;
+            Exiled.Events.Handles.Player.Died += OnPlayerDied;
+            Exiled.Events.Handles.Player.Left += OnPlayerLeft;
+            Exiled.Events.Handles.Player.ChangingItem += OnPlayerChangingItem;
+            Exiled.Events.Handles.Server.RoundStarted += OnRoundStart;
+        }
+
+        private void UnsubscribeEvents()
+        {
+            Exiled.Events.Handles.Player.Spawned -= OnPlayerSpawned;
+            Exiled.Events.Handles.Player.Died -= OnPlayerDied;
+            Exiled.Events.Handles.Player.Left -= OnPlayerLeft;
+            Exiled.Events.Handles.Player.ChangingItem -= OnPlayerChangingItem;
+            Exiled.Events.Handles.Server.RoundStarted -= OnRoundStart;
+        }
+        #endregion
+
+        #region 事件处理
+        private void OnRoundStart()
+        {
+            ScpPlayers.Clear();
+            UpdateAllHUD(forceUpdate: true);
+        }
+
+        private void OnPlayerSpawned(SpawnedEventArgs ev)
+        {
+            try
+            {
+                if (ev.Player.IsScp) 
+                    ScpPlayers.Add(ev.Player);
+                
+                ScheduleHUDUpdate();
+            }
+            catch (Exception ex)
+            {
+                LogError("生成事件错误", ex);
+            }
+        }
+
+        private void OnPlayerChangingItem(ChangingItemEventArgs ev)
+        {
+            if (ev.NewItem?.Type == ItemType.Radio && 
+                ev.Player.Role.Type == RoleTypeId.Scp079)
+            {
+                ev.Player.ShowHint(Config.ElectricBoardAlert, 3f);
+            }
+        }
+
+        private void OnPlayerDied(DiedEventArgs ev) => ScheduleHUDUpdate();
+        private void OnPlayerLeft(LeftEventArgs ev) => ScheduleHUDUpdate();
+        #endregion
+
+        #region HUD核心逻辑
+        private async void ScheduleHUDUpdate()
+        {
+            try
+            {
+                await Task.Delay(TimeSpan.FromSeconds(0.1));
+                
+                lock (UpdateLock)
+                {
+                    UpdateAllHUD();
+                }
+            }
+            catch (Exception ex)
+            {
+                LogError("HUD更新异常", ex);
+            }
+        }
+
+        private void UpdateAllHUD(bool forceUpdate = false)
+        {
+            var currentTick = DateTime.Now.Ticks;
+            
+            Player.List.ToList().ForEach(p =>
+            {
+                if (!forceUpdate && (currentTick - p.TemporaryData.Get<long>("LastHUDUpdate")) < Config.UpdateIntervalTicks)
+                    return;
+
+                ShowHUD(p);
+                p.TemporaryData.Set("LastHUDUpdate", currentTick);
+            });
+        }
+
+        private void ShowHUD(Player player)
+        {
+            try
+            {
+                string hudContent = BuildHUDContent(player);
+                var location = GetHUDLocation(player);
+                
+                player.ShowHint(hudContent, Config.HintDuration, location);
+            }
+            catch (Exception ex)
+            {
+                LogError($"HUD显示错误 ({player.Nickname})", ex);
+            }
+        }
+
+        private string BuildHUDContent(Player player)
+        {
+            if (player.IsScp)
+                return BuildScpHUD();
+            
+            if (player.IsSpectator)
+                return BuildSpectatorHUD();
+            
+            return BuildNormalHUD();
+        }
+        #endregion
+
+        #region HUD生成器
+        private string BuildNormalHUD()
+        {
+            return string.Format(Config.NormalHudFormat,
+                GetTeamCount(Team.FoundationForces),
+                GetTeamCount(Team.ChaosInsurgency),
+                GetRoleCount(RoleTypeId.Scientist),
+                GetRoleCount(RoleTypeId.ClassD)
+            ).ReplaceTeamColors(Config.TeamColors);
+        }
+
+        private string BuildScpHUD()
+        {
+            var scpInfo = ScpPlayers.Select(p => 
+                $"{p.Role.Name}: {p.Health} HP {(p.IsBreathScp ? "[窒息]" : "")}");
+            
+            return $"{Config.ScpHeader}{string.Join("\n", scpInfo)}";
+        }
+
+        private string BuildSpectatorHUD()
+        {
+            return string.Format(Config.SpectatorFormat,
+                GetTeamCount(Team.FoundationForces),
+                GetTeamCount(Team.ChaosInsurgency),
+                GetRoleCount(RoleTypeId.Scientist),
+                GetRoleCount(RoleTypeId.ClassD),
+                GetTeamCount(Team.SCPs)
+            ).ReplaceTeamColors(Config.TeamColors);
+        }
+        #endregion
+
+        #region 工具方法
+        private HintLocation GetHUDLocation(Player p) => 
+            p.IsScp ? HintLocation.BottomLeft : HintLocation.TopLeft;
+
+        private int GetTeamCount(Team team) => 
+            Player.List.Count(p => p.Team == team);
+
+        private int GetRoleCount(RoleTypeId role) => 
+            Player.List.Count(p => p.Role.Type == role);
+
+        private void ValidateConfig()
+        {
+            if (Config.TeamColors.Length < 4)
+                throw new ArgumentException("配置错误：TeamColors需要4个颜色值");
+        }
+
+        private void LogError(string context, Exception ex)
+        {
+            Log.Error($"=== 错误报告 [{context}] ===\n" +
+                     $"类型: {ex.GetType().Name}\n" +
+                     $"信息: {ex.Message}\n" +
+                     $"堆栈追踪:\n{ex.StackTrace}\n" +
+                     "============================");
+        }
+        #endregion
+    }
+
+    public static class StringExtensions
+    {
+        public static string ReplaceTeamColors(this string input, string[] colors)
+        {
+            return input
+                .Replace("{MTF}", colors[0])
+                .Replace("{Chaos}", colors[1])
+                .Replace("{Scientist}", colors[2])
+                .Replace("{DClass}", colors[3]);
+        }
+    }
+
+    public class Config : IConfig
+    {
+        [Description("启用插件")]
+        public bool IsEnabled { get; set; } = true;
+
+        [Description("HUD刷新间隔（秒）")]
+        public float UpdateInterval { 
+            get => (float)TimeSpan.FromTicks(UpdateIntervalTicks).TotalSeconds;
+            set => UpdateIntervalTicks = (long)(value * TimeSpan.TicksPerSecond);
+        }
+
+        [Description("HUD显示持续时间（秒）")]
+        public float HintDuration { get; set; } = 5f;
+
+        [Description("079电板提示")]
+        public string ElectricBoardAlert { get; set; } = "<color=yellow>⚡ 电力强化激活</color>";
+
+        [Description("阵营颜色 (MTF/Chaos/Scientist/DClass)")]
+        public string[] TeamColors { get; set; } = 
+        {
+            "#00FF00", "#FF6600", "#FFFF00", "#FF0000"
+        };
+
+        [Description("普通玩家HUD格式 (使用 {MTF} 等占位符)")]
+        public string NormalHudFormat { get; set; } = 
+            "<color={MTF}>九尾狐: {0}</color>\n" +
+            "<color={Chaos}>混沌: {1}</color>\n" +
+            "<color={Scientist}>科学家: {2}</color>\n" +
+            "<color={DClass}>D级: {3}</color>";
+
+        [Description("观察者HUD格式")]
+        public string SpectatorFormat { get; set; } = 
+            "<size=80%><color=white>┏ 全局统计 ┓</color>\n" +
+            "<color={MTF}>MTF: {0}</color> | <color={Chaos}>混沌: {1}</color>\n" +
+            "<color={Scientist}>科学家: {2}</color> | <color={DClass}>D级: {3}</color>\n" +
+            "<color=red>SCP: {4}</color>\n" +
+            "<color=white>┗━━━━━━━━━━━┛</color></size>";
+
+        [Description("SCP信息标题")]
+        public string ScpHeader { get; set; } = "<color=red>■ SCP阵营 ■</color>\n";
+
+        [YamlIgnore]
+        public long UpdateIntervalTicks { get; set; } = TimeSpan.TicksPerSecond * 2;
+    }
+}
